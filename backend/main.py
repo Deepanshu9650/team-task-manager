@@ -9,21 +9,18 @@ import models
 import database
 import auth
 
-# Initialize Database
 database.init_db()
 
 app = FastAPI(title="Team Task Manager API")
 
-# --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include auth routes from auth.py
 app.include_router(auth.router)
 
 
@@ -40,7 +37,7 @@ class TaskCreate(BaseModel):
     due_date: Optional[datetime] = None
 
 class TaskUpdateStatus(BaseModel):
-    status: str  # "To-Do", "In-Progress", "Done"
+    status: str
 
 
 # --- PROJECT ROUTES ---
@@ -51,7 +48,11 @@ def create_project(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.check_admin)
 ):
-    new_project = models.Project(name=project.name, description=project.description)
+    new_project = models.Project(
+        name=project.name,
+        description=project.description,
+        owner_id=current_user.id  # Track which admin created it
+    )
     db.add(new_project)
     db.commit()
     db.refresh(new_project)
@@ -59,6 +60,7 @@ def create_project(
         "id": new_project.id,
         "name": new_project.name,
         "description": new_project.description,
+        "owner_id": new_project.owner_id,
         "created_at": str(new_project.created_at) if new_project.created_at else None
     }
 
@@ -67,12 +69,28 @@ def get_projects(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    projects = db.query(models.Project).all()
+    # Admin sees only their own projects
+    # Member sees projects where they have assigned tasks
+    if current_user.role.value == "Admin":
+        projects = db.query(models.Project).filter(
+            models.Project.owner_id == current_user.id
+        ).all()
+    else:
+        # Member: get projects where they have tasks assigned
+        assigned_project_ids = db.query(models.Task.project_id).filter(
+            models.Task.assigned_to == current_user.id
+        ).distinct().all()
+        ids = [p[0] for p in assigned_project_ids]
+        projects = db.query(models.Project).filter(
+            models.Project.id.in_(ids)
+        ).all()
+
     return [
         {
             "id": p.id,
             "name": p.name,
             "description": p.description,
+            "owner_id": p.owner_id,
             "created_at": str(p.created_at) if p.created_at else None
         }
         for p in projects
@@ -87,12 +105,21 @@ def create_task(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.check_admin)
 ):
+    # Make sure the project belongs to this admin
+    project = db.query(models.Project).filter(
+        models.Project.id == task.project_id,
+        models.Project.owner_id == current_user.id
+    ).first()
+    if not project:
+        raise HTTPException(status_code=403, detail="You can only assign tasks to your own projects")
+
     new_task = models.Task(
         title=task.title,
         description=task.description,
         project_id=task.project_id,
         assigned_to=task.assigned_to,
-        due_date=task.due_date
+        due_date=task.due_date,
+        created_by=current_user.id  # Track which admin created task
     )
     db.add(new_task)
     db.commit()
@@ -104,6 +131,7 @@ def create_task(
         "status": new_task.status,
         "project_id": new_task.project_id,
         "assigned_to": new_task.assigned_to,
+        "created_by": new_task.created_by,
         "due_date": str(new_task.due_date) if new_task.due_date else None
     }
 
@@ -112,7 +140,17 @@ def get_tasks(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    tasks = db.query(models.Task).all()
+    if current_user.role.value == "Admin":
+        # Admin sees only tasks THEY created
+        tasks = db.query(models.Task).filter(
+            models.Task.created_by == current_user.id
+        ).all()
+    else:
+        # Member sees only tasks assigned TO THEM
+        tasks = db.query(models.Task).filter(
+            models.Task.assigned_to == current_user.id
+        ).all()
+
     return [
         {
             "id": t.id,
@@ -121,6 +159,7 @@ def get_tasks(
             "status": t.status,
             "project_id": t.project_id,
             "assigned_to": t.assigned_to,
+            "created_by": t.created_by,
             "due_date": str(t.due_date) if t.due_date else None
         }
         for t in tasks
@@ -136,6 +175,12 @@ def update_task_status(
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Admin can only update their own tasks, Member only their assigned tasks
+    if current_user.role.value == "Admin" and task.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your task")
+    if current_user.role.value == "Member" and task.assigned_to != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your task")
 
     task.status = status_update.status
     db.commit()
@@ -171,6 +216,10 @@ def delete_user(
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Admin cannot delete another Admin
+    if user.role.value == "Admin":
+        raise HTTPException(status_code=403, detail="You cannot remove another Admin!")
 
     db.delete(user)
     db.commit()
